@@ -1,4 +1,6 @@
-import shutil, os, json, uuid, threading, secrets, time, contextlib
+import shutil, os, json, uuid, threading, secrets, time, contextlib, logging
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,13 +11,13 @@ from google_auth_oauthlib.flow import Flow
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 import httpx
-from backend.enhanced_ingest import ingest_enhanced, list_documents, delete_document
+from backend.enhanced_ingest import ingest_enhanced, list_documents, delete_document, get_full_texts_for_documents
 from backend.planner import generate_plans
 from backend.scorer import select_best_plan
 from backend.calendar_tool import schedule_plan
 from backend.feedback import replan
 from backend.agent import chat as agent_chat
-from backend.models import Session, StudyPlan, Task, Document as DocModel
+from backend.models import Session, StudyPlan, Task, Document as DocModel, DocumentChunk
 from backend.timetable import add_timeframes_to_plan
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -37,6 +39,7 @@ AUTH_TOKENS: dict[str, dict] = {}
 AUTH_FLOWS: dict[str, Flow] = {}
 AUTH_STATE_TO_SESSION: dict[str, str] = {}
 AUTH_LOCK = threading.Lock()
+logger = logging.getLogger(__name__)
 
 
 @contextlib.contextmanager
@@ -72,6 +75,8 @@ class PlanRequest(BaseModel):
     weak_subjects: list[str] = []
     start_date: str = "2025-07-14"
     start_time: str = "09:00"
+    document_ids: list[int] = []
+    use_all_documents: bool = True
 
 
 class FeedbackRequest(BaseModel):
@@ -182,6 +187,191 @@ def _issue_session_token(user: dict) -> str:
 def _resolve_session_token(token: str) -> dict | None:
     with AUTH_LOCK:
         return AUTH_TOKENS.get(token)
+
+
+def _get_user_documents(user_id: str) -> list:
+    """Fetch all documents for a user."""
+    db_session = Session()
+    docs = db_session.query(DocModel).filter_by(user_id=user_id).all()
+    db_session.close()
+    return docs
+
+
+def _validate_documents_ingested(
+    user_id: str,
+    context: str = "quiz generation",
+    require_analysis: bool = False,
+):
+    """
+    Validate that user has uploaded and processed documents.
+    Raises HTTPException with detailed message if prerequisites not met.
+    """
+    docs = _get_user_documents(user_id)
+    
+    if not docs:
+        raise HTTPException(
+            status_code=412,
+            detail="❌ No documents uploaded. Prerequisites not met — cannot generate quiz or plan. "
+                   "Please upload course materials (syllabus, notes, or textbook) first."
+        )
+
+    docs_with_text = [d for d in docs if getattr(d, "full_text", None)]
+    if not docs_with_text:
+        raise HTTPException(
+            status_code=412,
+            detail="❌ Documents uploaded but not properly parsed. "
+                   "Unable to read document content — cannot proceed with " + context + ". "
+                   "Please try re-uploading your documents."
+        )
+
+    if require_analysis:
+        docs_with_analysis = [d for d in docs if getattr(d, "analysis_json", None)]
+        if not docs_with_analysis:
+            raise HTTPException(
+                status_code=412,
+                detail="⚠️ Documents parsed but analysis incomplete. "
+                       "The model is unable to understand document structure and prerequisites. "
+                       "Please wait a moment for analysis to complete, or re-upload."
+            )
+
+
+def _build_topic_catalog_from_docs(docs: list) -> list[dict]:
+    """Extract topic metadata from cached document analyses for planning relevance."""
+    stop_words = {
+        "that", "with", "from", "this", "there", "their", "about", "which", "would", "could",
+        "should", "while", "where", "when", "into", "between", "after", "before", "under",
+        "over", "been", "being", "also", "than", "such", "have", "has", "had", "were", "was",
+        "will", "shall", "might", "because", "through", "across", "these", "those", "they", "them",
+        "your", "yours", "ours", "our", "its", "itself", "hers", "his", "and", "the", "for",
+        "are", "you", "not", "can", "all", "any", "but", "one", "two", "three", "using", "used",
+        "study", "document", "paper", "article", "report", "data", "information",
+    }
+
+    def _clean_topic_label(value: str) -> str:
+        text = " ".join(str(value or "").split()).strip("-:;,. ")
+        lowered = text.lower()
+        if "http" in lowered or "www." in lowered:
+            return ""
+        if any(token in text for token in ["?", "=", "/", "\\", "&", "#"]):
+            return ""
+        if "," in text or ";" in text or ":" in text:
+            return ""
+        if "(" in text or ")" in text:
+            return ""
+        if any(ch.isdigit() for ch in text) and len(text.split()) > 6:
+            return ""
+        if len(text) > 72:
+            return ""
+        words = text.split()
+        if len(words) < 2:
+            return ""
+        if len(words) > 8:
+            return ""
+        return text
+
+    def _infer_topics_from_text(full_text: str) -> list[str]:
+        import re
+
+        words = re.findall(r"[A-Za-z][A-Za-z\-]{2,}", full_text or "")
+        lowered = [w.lower() for w in words]
+
+        unigrams = [w for w in lowered if w not in stop_words and len(w) >= 4]
+        bigrams = []
+        for i in range(len(lowered) - 1):
+            a, b = lowered[i], lowered[i + 1]
+            if a in stop_words or b in stop_words:
+                continue
+            if len(a) < 4 or len(b) < 4:
+                continue
+            bigrams.append(f"{a} {b}")
+
+        counts = Counter(bigrams + unigrams)
+        topics = []
+        for phrase, _ in counts.most_common(18):
+            label = " ".join(part.capitalize() for part in phrase.split())
+            label = _clean_topic_label(label)
+            if not label:
+                continue
+            if label.lower() in {x.lower() for x in topics}:
+                continue
+            topics.append(label)
+            if len(topics) >= 8:
+                break
+        return topics
+
+    catalog = []
+    for doc in docs:
+        if not getattr(doc, "analysis_json", None):
+            continue
+        try:
+            analysis = json.loads(doc.analysis_json)
+        except Exception:
+            continue
+        topics = analysis.get("topics_covered", []) if isinstance(analysis, dict) else []
+        for topic in topics:
+            if isinstance(topic, dict):
+                name = _clean_topic_label(topic.get("topic") or "")
+                if not name:
+                    continue
+                catalog.append(
+                    {
+                        "topic": name,
+                        "difficulty": str(topic.get("difficulty") or "intermediate"),
+                        "estimated_hours": int(topic.get("estimated_hours") or 2),
+                        "source_document": getattr(doc, "filename", "selected documents"),
+                    }
+                )
+
+    # If topic extraction is sparse/noisy, backfill using section titles from parsed chunks.
+    if len(catalog) < 6 and docs:
+        session = Session()
+        doc_ids = [d.id for d in docs]
+        rows = session.query(DocumentChunk.document_id, DocumentChunk.section_title).filter(
+            DocumentChunk.document_id.in_(doc_ids)
+        ).all()
+        session.close()
+
+        doc_name_by_id = {d.id: d.filename for d in docs}
+        cleaned_sections = []
+        for document_id, section_title in rows:
+            label = _clean_topic_label(section_title or "")
+            if label:
+                cleaned_sections.append((document_id, label))
+
+        counts = Counter(cleaned_sections)
+        for (document_id, label), _ in counts.most_common(12):
+            catalog.append(
+                {
+                    "topic": label,
+                    "difficulty": "intermediate",
+                    "estimated_hours": 2,
+                    "source_document": doc_name_by_id.get(document_id, "selected documents"),
+                }
+            )
+
+    # Final enrichment: infer concise keywords directly from document text.
+    if len(catalog) < 8:
+        for doc in docs:
+            for topic in _infer_topics_from_text(getattr(doc, "full_text", "")[:50000]):
+                catalog.append(
+                    {
+                        "topic": topic,
+                        "difficulty": "intermediate",
+                        "estimated_hours": 2,
+                        "source_document": getattr(doc, "filename", "selected documents"),
+                    }
+                )
+
+    # De-duplicate by topic + source and keep stable order.
+    seen = set()
+    deduped = []
+    for item in catalog:
+        key = (item["topic"].lower(), item["source_document"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
 
 
 def get_current_user(authorization: str | None = Header(default=None)) -> dict:
@@ -410,12 +600,48 @@ def remove_document(doc_id: int, current_user: dict = Depends(get_current_user))
 @app.post("/plan")
 def create_plan(req: PlanRequest, current_user: dict = Depends(get_current_user)):
     try:
+        # ✅ PREREQUISITE CHECK: Ensure documents are ingested and readable
+        _validate_documents_ingested(current_user["id"], context="study plan generation")
+
+        docs = _get_user_documents(current_user["id"])
+        doc_map = {d.id: d for d in docs}
+
+        selected_ids = []
+        if req.use_all_documents or not req.document_ids:
+            selected_ids = list(doc_map.keys())
+        else:
+            selected_ids = [doc_id for doc_id in req.document_ids if doc_id in doc_map]
+
+        if not selected_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="No valid documents selected for planning. Choose one or more uploaded documents."
+            )
+
+        selected_names = [doc_map[doc_id].filename for doc_id in selected_ids]
+        selected_docs = [doc_map[doc_id] for doc_id in selected_ids]
+        selected_text = get_full_texts_for_documents(current_user["id"], selected_ids)
+        if not selected_text.strip():
+            raise HTTPException(
+                status_code=412,
+                detail="Selected documents have no extracted text. Please re-upload those documents."
+            )
+
+        topic_catalog = _build_topic_catalog_from_docs(selected_docs)
+        
         constraints = {
             "daily_hours": req.daily_hours,
             "weak_subjects": req.weak_subjects,
-            "start_date": req.start_date
+            "start_date": req.start_date,
+            "document_ids": selected_ids,
+            "topic_catalog": topic_catalog,
         }
-        plans = generate_plans(req.request, constraints)
+        plans = generate_plans(
+            req.request,
+            constraints,
+            full_text=selected_text,
+            selected_document_names=selected_names,
+        )
         best = select_best_plan(plans, constraints)
         best = add_timeframes_to_plan(best, req.start_date, req.start_time)
 
@@ -444,7 +670,14 @@ def create_plan(req: PlanRequest, current_user: dict = Depends(get_current_user)
         plan_id = db_plan.id
         session.close()
 
-        return {"plan": best, "calendar_events": len(event_ids), "plan_id": plan_id}
+        return {
+            "plan": best,
+            "calendar_events": len(event_ids),
+            "plan_id": plan_id,
+            "selected_documents": [{"id": i, "filename": doc_map[i].filename} for i in selected_ids],
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating plan: {str(e)}")
 
@@ -513,6 +746,9 @@ def chat(req: ChatRequest, current_user: dict = Depends(get_current_user)):
 def get_prerequisites(doc_id: int, current_user: dict = Depends(get_current_user)):
     """Generate prerequisite report for a document using full text + Ollama."""
     try:
+        # ✅ PREREQUISITE CHECK: Ensure documents are ingested
+        _validate_documents_ingested(current_user["id"], context="prerequisite analysis")
+        
         import json
 
         db_session = Session()
@@ -525,6 +761,18 @@ def get_prerequisites(doc_id: int, current_user: dict = Depends(get_current_user
         # Use cached analysis if available
         if doc.analysis_json:
             analysis = json.loads(doc.analysis_json)
+            topics = analysis.get("topics_covered", []) if isinstance(analysis, dict) else []
+            prereqs = analysis.get("prerequisites", []) if isinstance(analysis, dict) else []
+            # If cached analysis is effectively empty, regenerate once from full text.
+            if (not topics and not prereqs) and doc.full_text:
+                from backend.enhanced_ingest import analyse_document
+                analysis = analyse_document(doc.full_text, doc.filename)
+                db_session = Session()
+                doc_to_update = db_session.query(DocModel).filter_by(id=doc_id, user_id=current_user["id"]).first()
+                if doc_to_update:
+                    doc_to_update.analysis_json = json.dumps(analysis)
+                    db_session.commit()
+                db_session.close()
             from backend.enhanced_ingest import format_prerequisite_report
             return {
                 "doc_id": doc_id,
@@ -535,7 +783,11 @@ def get_prerequisites(doc_id: int, current_user: dict = Depends(get_current_user
 
         # Generate fresh analysis from full text
         if not doc.full_text:
-            raise HTTPException(status_code=400, detail="Document has no extracted text. Re-upload it.")
+            raise HTTPException(
+                status_code=412,
+                detail="❌ Document has no extracted text — cannot analyze prerequisites. "
+                       "The model is unable to read this document. Please re-upload it."
+            )
 
         from backend.enhanced_ingest import analyse_document, format_prerequisite_report
         analysis = analyse_document(doc.full_text, doc.filename)
@@ -559,10 +811,92 @@ def get_prerequisites(doc_id: int, current_user: dict = Depends(get_current_user
         raise HTTPException(status_code=500, detail=f"Error generating prerequisites: {str(e)}")
 
 
+def _fallback_quiz_from_analysis(doc, analysis: dict, num_questions: int, topic_hints: list[str] | None = None) -> list[dict]:
+    """Produce deterministic, document-grounded MCQs when LLM quiz generation fails."""
+    def _clean_topic(text: str) -> str:
+        cleaned = " ".join(str(text or "").split())
+        cleaned = cleaned.strip("-:;,. ")
+        if any(token in cleaned for token in ["?", "=", "/", "\\", "&", "#"]):
+            return ""
+        if "," in cleaned or ";" in cleaned or ":" in cleaned:
+            return ""
+        if "(" in cleaned or ")" in cleaned:
+            return ""
+        if len(cleaned.split()) > 8:
+            return ""
+        if len(cleaned) > 72:
+            cleaned = cleaned[:72].rstrip() + "..."
+        return cleaned or "Core concepts"
+
+    topics = []
+    if topic_hints:
+        for hint in topic_hints:
+            label = _clean_topic(hint)
+            if label:
+                topics.append(label)
+
+    if isinstance(analysis, dict):
+        for item in (analysis.get("topics_covered") or []):
+            if isinstance(item, dict) and item.get("topic"):
+                label = _clean_topic(item["topic"])
+                if label:
+                    topics.append(label)
+            elif isinstance(item, str):
+                label = _clean_topic(item)
+                if label:
+                    topics.append(label)
+
+    if not topics:
+        lines = [ln.strip(" -\t") for ln in (doc.full_text or "").splitlines() if ln.strip()]
+        topics = []
+        for line in lines:
+            if not (6 <= len(line) <= 120):
+                continue
+            label = _clean_topic(line)
+            if label:
+                topics.append(label)
+            if len(topics) >= 8:
+                break
+
+    if not topics:
+        topics = ["Core concepts from uploaded document"]
+
+    difficulties = ["easy", "medium", "hard"]
+    questions = []
+    for i in range(max(1, num_questions)):
+        topic = topics[i % len(topics)]
+        distractors = [t for t in topics if t != topic]
+        while len(distractors) < 3:
+            distractors.append(f"Related concept {len(distractors) + 1}")
+
+        options = {
+            "A": f"The document explicitly discusses {topic} as a key concept.",
+            "B": f"The document focuses primarily on {distractors[0]} instead of {topic}.",
+            "C": f"{topic} is mentioned only as unrelated background and not part of the main content.",
+            "D": f"The document states that {topic} should be ignored while studying.",
+        }
+
+        questions.append(
+            {
+                "question_number": i + 1,
+                "topic": topic,
+                "difficulty": difficulties[i % len(difficulties)],
+                "question": f"According to the uploaded document, what is the most accurate statement about {topic}?",
+                "options": options,
+                "correct_answer": "A",
+                "explanation": f"The generated quiz is grounded in the document topic list, where {topic} appears as covered content.",
+            }
+        )
+    return questions[:num_questions]
+
+
 @app.get("/quiz/{doc_id}")
 def generate_quiz(doc_id: int, num_questions: int = 10, current_user: dict = Depends(get_current_user)):
     """Generate MCQ quiz from document content using Ollama."""
     try:
+        # ✅ PREREQUISITE CHECK: Ensure documents are ingested and readable
+        _validate_documents_ingested(current_user["id"], context="quiz generation")
+        
         from backend.llm_router import llm_json
         import json
 
@@ -574,16 +908,36 @@ def generate_quiz(doc_id: int, num_questions: int = 10, current_user: dict = Dep
             raise HTTPException(status_code=404, detail="Document not found")
 
         if not doc.full_text:
-            raise HTTPException(status_code=400, detail="Document has no extracted text. Re-upload it.")
+            raise HTTPException(
+                status_code=412,
+                detail="❌ Document has no extracted text — cannot generate quiz. "
+                       "The model is unable to read this document. Please re-upload it."
+            )
+        
+        if not doc.analysis_json:
+            from backend.enhanced_ingest import analyse_document
+
+            analysis = analyse_document(doc.full_text, doc.filename)
+            db_session = Session()
+            doc_to_update = db_session.query(DocModel).filter_by(id=doc_id, user_id=current_user["id"]).first()
+            if doc_to_update:
+                doc_to_update.analysis_json = json.dumps(analysis)
+                db_session.commit()
+            db_session.close()
+            doc.analysis_json = json.dumps(analysis)
 
         # Use analysis topics to guide quiz generation
         topics_context = ""
-        if doc.analysis_json:
+        analysis = {}
+        try:
             analysis = json.loads(doc.analysis_json)
             topics = analysis.get("topics_covered", [])
             if topics:
                 topic_names = [t["topic"] for t in topics]
                 topics_context = f"\nFocus on these topics: {', '.join(topic_names)}"
+        except Exception as e:
+            import logging
+            logging.warning(f"Could not parse analysis JSON: {e}")
 
         prompt = f"""Read the following document carefully and generate exactly {num_questions} multiple choice questions (MCQs) that test deep understanding of the content.
 {topics_context}
@@ -618,10 +972,60 @@ Return ONLY a JSON array with exactly {num_questions} objects:
   }}
 ]"""
 
-        questions = llm_json(prompt, temperature=0.4)
+        questions = []
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(llm_json, prompt, "", 0.3)
+                raw_questions = future.result(timeout=40)
+
+            if isinstance(raw_questions, list):
+                questions = raw_questions
+            elif isinstance(raw_questions, dict):
+                questions = (
+                    raw_questions.get("questions")
+                    or raw_questions.get("quiz")
+                    or raw_questions.get("items")
+                    or []
+                )
+            else:
+                questions = []
+        except FutureTimeoutError:
+            logger.warning("LLM quiz generation timed out; using deterministic fallback quiz.")
+        except Exception as e:
+            logger.warning("LLM quiz generation failed (%s). Falling back to deterministic quiz.", e)
 
         if not isinstance(questions, list) or len(questions) == 0:
-            raise ValueError("LLM did not return valid questions")
+            doc_topic_hints = [x.get("topic", "") for x in _build_topic_catalog_from_docs([doc])]
+            questions = _fallback_quiz_from_analysis(doc, analysis, num_questions, topic_hints=doc_topic_hints)
+
+        # Normalize each question shape.
+        normalized_questions = []
+        for idx, q in enumerate(questions, 1):
+            if not isinstance(q, dict):
+                continue
+            options = q.get("options") or {}
+            if not isinstance(options, dict):
+                options = {}
+            # Force A/B/C/D keys if LLM returned arrays or wrong keys.
+            if set(options.keys()) != {"A", "B", "C", "D"}:
+                vals = list(options.values()) if options else []
+                while len(vals) < 4:
+                    vals.append(f"Option {len(vals) + 1}")
+                options = {"A": vals[0], "B": vals[1], "C": vals[2], "D": vals[3]}
+
+            normalized_questions.append({
+                "question_number": idx,
+                "topic": q.get("topic", "Document concepts"),
+                "difficulty": q.get("difficulty", "medium"),
+                "question": q.get("question", "Question unavailable"),
+                "options": options,
+                "correct_answer": q.get("correct_answer", "A"),
+                "explanation": q.get("explanation", "Based on the uploaded document."),
+            })
+
+        questions = normalized_questions
+        if not questions:
+            raise ValueError("Quiz normalization produced no valid questions")
 
         # Ensure question numbers are correct
         for i, q in enumerate(questions):

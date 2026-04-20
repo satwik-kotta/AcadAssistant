@@ -29,57 +29,172 @@ logger = logging.getLogger(__name__)
 VECTORSTORE_PATH = "vectorstore/index"
 
 
+def _fallback_analysis_from_text(full_text: str, filename: str) -> dict:
+    """Heuristic fallback when LLM output is missing/invalid."""
+    text = full_text or ""
+    lines = [ln.strip(" -•\t") for ln in text.splitlines() if ln.strip()]
+    lowered = text.lower()
+
+    topic_markers = [
+        "topics", "syllabus", "module", "chapter", "unit", "includes", "covers", "course content"
+    ]
+    prereq_markers = [
+        "prerequisite", "should know", "background", "before starting", "assumes knowledge"
+    ]
+
+    topics = []
+    prereqs = []
+
+    for ln in lines:
+        ln_lower = ln.lower()
+        if len(ln) < 4 or len(ln) > 120:
+            continue
+        if any(k in ln_lower for k in ["topic", "chapter", "module", "unit", "week"]):
+            if ln not in topics:
+                topics.append(ln)
+
+    for ln in lines:
+        ln_lower = ln.lower()
+        if any(marker in ln_lower for marker in prereq_markers):
+            prereqs.append({
+                "topic": ln,
+                "reason": "Mentioned as required background in the uploaded document.",
+                "urgency": "must_know",
+                "resources": "Review class notes or introductory material for this topic."
+            })
+
+    # If no explicit prerequisites found, infer from common foundational terms.
+    if not prereqs:
+        inferred = []
+        mapping = {
+            "algebra": "Algebra fundamentals",
+            "calculus": "Basic calculus",
+            "probability": "Basic probability",
+            "statistics": "Basic statistics",
+            "linear algebra": "Linear algebra basics",
+            "programming": "Basic programming",
+            "python": "Python basics",
+            "trigonometry": "Trigonometry basics",
+        }
+        for key, label in mapping.items():
+            if key in lowered:
+                inferred.append({
+                    "topic": label,
+                    "reason": f"The uploaded document references {key}, suggesting prior familiarity is helpful.",
+                    "urgency": "good_to_know",
+                    "resources": "Quick review from introductory textbook chapters or lecture notes."
+                })
+        prereqs = inferred
+
+    normalized_topics = [
+        {"topic": t[:80], "difficulty": "intermediate", "estimated_hours": 2}
+        for t in topics[:10]
+    ]
+
+    if not normalized_topics:
+        normalized_topics = [
+            {"topic": "Core concepts from uploaded document", "difficulty": "intermediate", "estimated_hours": 2}
+        ]
+
+    return {
+        "document_type": "syllabus" if any(m in lowered for m in topic_markers) else "other",
+        "subject": Path(filename).stem or "Uploaded document",
+        "topics_covered": normalized_topics,
+        "prerequisites": prereqs[:12],
+        "suggested_study_order": [t["topic"] for t in normalized_topics[:8]],
+        "total_estimated_hours": max(2, len(normalized_topics) * 2),
+        "difficulty_level": "intermediate",
+        "key_deadlines": [],
+        "summary": "Analysis inferred from uploaded document text.",
+    }
+
+
+def _normalize_analysis(raw: dict | list | None, full_text: str, filename: str) -> dict:
+    """Normalize different LLM JSON shapes into the required analysis schema."""
+    if isinstance(raw, list):
+        # Unexpected shape: treat as topic list.
+        raw = {"topics_covered": raw}
+
+    if not isinstance(raw, dict):
+        return _fallback_analysis_from_text(full_text, filename)
+
+    # Accept wrappers like {"analysis": {...}}.
+    if isinstance(raw.get("analysis"), dict):
+        raw = raw["analysis"]
+
+    topics = raw.get("topics_covered") or raw.get("topics") or []
+    prereqs = raw.get("prerequisites") or raw.get("prerequisite_topics") or []
+    order = raw.get("suggested_study_order") or raw.get("study_order") or []
+    deadlines = raw.get("key_deadlines") or []
+
+    norm_topics = []
+    for t in topics:
+        if isinstance(t, dict) and t.get("topic"):
+            norm_topics.append({
+                "topic": str(t.get("topic"))[:80],
+                "difficulty": str(t.get("difficulty", "intermediate")),
+                "estimated_hours": int(t.get("estimated_hours", 2) or 2),
+            })
+        elif isinstance(t, str) and t.strip():
+            norm_topics.append({"topic": t.strip()[:80], "difficulty": "intermediate", "estimated_hours": 2})
+
+    norm_prereqs = []
+    for p in prereqs:
+        if isinstance(p, dict) and p.get("topic"):
+            norm_prereqs.append({
+                "topic": str(p.get("topic"))[:80],
+                "reason": str(p.get("reason", "Required background for topics in this document.")),
+                "urgency": str(p.get("urgency", "good_to_know")),
+                "resources": str(p.get("resources", "Review foundational notes or introductory material.")),
+            })
+        elif isinstance(p, str) and p.strip():
+            norm_prereqs.append({
+                "topic": p.strip()[:80],
+                "reason": "Required background for topics in this document.",
+                "urgency": "good_to_know",
+                "resources": "Review foundational notes or introductory material.",
+            })
+
+    normalized = {
+        "document_type": str(raw.get("document_type", "other")),
+        "subject": str(raw.get("subject") or Path(filename).stem or "Uploaded document"),
+        "topics_covered": norm_topics,
+        "prerequisites": norm_prereqs,
+        "suggested_study_order": [str(x) for x in order if str(x).strip()],
+        "total_estimated_hours": int(raw.get("total_estimated_hours", max(2, len(norm_topics) * 2)) or 2),
+        "difficulty_level": str(raw.get("difficulty_level", "intermediate")),
+        "key_deadlines": deadlines if isinstance(deadlines, list) else [],
+        "summary": str(raw.get("summary", "")),
+    }
+
+    # Guardrail: never return both empty topics and empty prerequisites.
+    if not normalized["topics_covered"] and not normalized["prerequisites"]:
+        return _fallback_analysis_from_text(full_text, filename)
+
+    if not normalized["topics_covered"]:
+        normalized["topics_covered"] = [
+            {"topic": "Core concepts from uploaded document", "difficulty": "intermediate", "estimated_hours": 2}
+        ]
+
+    if not normalized["suggested_study_order"]:
+        normalized["suggested_study_order"] = [t["topic"] for t in normalized["topics_covered"][:8]]
+
+    if not normalized["summary"]:
+        normalized["summary"] = "Analysis generated from the uploaded document."
+
+    return normalized
+
+
 # ── Prerequisite & topic extraction ──────────────────────────────────────────
 
 def analyse_document(full_text: str, filename: str) -> dict:
     """
-    Use LLM to analyse the full document text and extract:
-    - Topics covered
-    - Prerequisites the student needs before starting
-    - Suggested study order
-    - Difficulty level
-    Returns a dict (also safe to store as JSON).
+    Use Ollama (Llama 3.1) to analyse the full document text and extract
+    topics, prerequisites, study order, difficulty, and deadlines.
     """
-    prompt = f"""You are an expert academic advisor. Carefully read the following document 
-and provide a structured analysis.
+    from backend.llm_router import llm_json
 
-Document name: {filename}
-
-Document content:
-{full_text[:50000]}"""
-
-    system = """Return ONLY a JSON object with this exact structure (no markdown, no explanation):
-{{
-  "document_type": "syllabus | notes | assignment | textbook | other",
-  "subject": "main subject name",
-  "topics_covered": [
-    {{"topic": "topic name", "difficulty": "beginner|intermediate|advanced", "estimated_hours": 2}}
-  ],
-  "prerequisites": [
-    {{
-      "topic": "prerequisite topic name",
-      "reason": "why the student needs this before starting",
-      "urgency": "must_know | good_to_know | optional",
-      "resources": "suggested way to learn this (e.g. Khan Academy, YouTube, textbook chapter)"
-    }}
-  ],
-  "suggested_study_order": ["topic 1", "topic 2", "topic 3"],
-  "total_estimated_hours": 20,
-  "difficulty_level": "beginner | intermediate | advanced",
-  "key_deadlines": [
-    {{"task": "assignment name", "date": "date if mentioned or null"}}
-  ],
-  "summary": "2-3 sentence summary of what this document covers"
-}}"""
-
-    try:
-        return llm_json(
-            prompt=prompt,
-            system=system,
-            temperature=0.2
-        )
-    except Exception as e:
-        logger.warning(f"Document analysis unavailable ({e}). Returning minimal analysis.")
+    if not full_text or not full_text.strip():
         return {
             "document_type": "unknown",
             "subject": filename,
@@ -89,8 +204,70 @@ Document content:
             "total_estimated_hours": 0,
             "difficulty_level": "unknown",
             "key_deadlines": [],
-            "summary": "Analysis unavailable."
+            "summary": "No text could be extracted from this document."
         }
+
+    prompt = f"""You are a university professor reviewing a student's study material.
+
+Read this document completely and carefully:
+
+FILENAME: {filename}
+CONTENT:
+{full_text[:50000]}
+
+After reading, extract a detailed academic analysis. Be specific — use exact terminology, concept names, and chapter references from the document itself.
+
+Return ONLY this JSON structure, no markdown:
+{{
+  "document_type": "syllabus or notes or assignment or textbook or research_paper",
+  "subject": "exact course or subject name as written in the document",
+  "summary": "3-4 sentences explaining what this document is about, what a student will learn, and how it is structured",
+  "difficulty_level": "beginner or intermediate or advanced",
+  "total_estimated_hours": <integer hours to study this fully>,
+  "topics_covered": [
+    {{
+      "topic": "exact concept name as it appears in the document",
+      "difficulty": "beginner or intermediate or advanced",
+      "estimated_hours": <integer>,
+      "description": "one sentence explaining what this topic covers based on the document content"
+    }}
+  ],
+  "prerequisites": [
+    {{
+      "topic": "specific concept the student must already know",
+      "reason": "exactly why this is needed — reference what part of the document requires it",
+      "urgency": "must_know or good_to_know or optional",
+      "resources": "specific resource to learn this e.g. Khan Academy Calculus course, MIT OpenCourseWare 6.001"
+    }}
+  ],
+  "suggested_study_order": [
+    "topic 1 — reason why this comes first",
+    "topic 2 — reason why this follows topic 1"
+  ],
+  "key_deadlines": [
+    {{"task": "exact assignment or exam name from document", "date": "date as written or null"}}
+  ]
+}}
+
+Rules:
+- Every topic must be a real concept from the document, not a generic label
+- Prerequisites must be things NOT in the document that the student needs beforehand
+- Study order must reflect actual dependencies between topics in the document
+- If no deadlines are mentioned, return empty array"""
+
+    try:
+        raw = llm_json(prompt=prompt, temperature=0.1)
+        result = _normalize_analysis(raw, full_text, filename)
+        logger.info(
+            "Document analysis complete: %s topics, %s prerequisites",
+            len(result.get("topics_covered", [])),
+            len(result.get("prerequisites", [])),
+        )
+        return result
+
+    except Exception as e:
+        logger.warning(f"Document analysis failed ({e}). Using heuristic fallback.")
+        return _fallback_analysis_from_text(full_text, filename)
 
 
 def format_prerequisite_report(analysis: dict) -> str:
@@ -429,6 +606,18 @@ def get_all_full_texts() -> str:
     """Return full text of all uploaded documents concatenated."""
     session = Session()
     docs = session.query(DocModel).all()
+    session.close()
+    parts = [d.full_text for d in docs if d.full_text]
+    return "\n\n---\n\n".join(parts)
+
+
+def get_full_texts_for_documents(user_id: str, document_ids: list[int] | None = None) -> str:
+    """Return concatenated text for selected user documents."""
+    session = Session()
+    query = session.query(DocModel).filter_by(user_id=user_id)
+    if document_ids:
+        query = query.filter(DocModel.id.in_(document_ids))
+    docs = query.all()
     session.close()
     parts = [d.full_text for d in docs if d.full_text]
     return "\n\n---\n\n".join(parts)

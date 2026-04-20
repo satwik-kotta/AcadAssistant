@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, timedelta
 
+from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -17,11 +18,34 @@ def _calendar_enabled() -> bool:
     }
 
 
+def _calendar_interactive_auth_enabled() -> bool:
+    return (os.getenv("CALENDAR_INTERACTIVE_AUTH") or "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def get_calendar_service():
     creds = None
     if os.path.exists("token.json"):
         creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+
+    # Prefer non-interactive token refresh in backend/API execution.
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            with open("token.json", "w") as f:
+                f.write(creds.to_json())
+        except Exception:
+            creds = None
+
     if not creds or not creds.valid:
+        if not _calendar_interactive_auth_enabled():
+            raise RuntimeError(
+                "Google Calendar token unavailable/invalid and interactive auth is disabled"
+            )
         flow = InstalledAppFlow.from_client_secrets_file(
             os.getenv("GOOGLE_CALENDAR_CREDENTIALS", "credentials.json"), SCOPES
         )

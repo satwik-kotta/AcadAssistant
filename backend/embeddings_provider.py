@@ -4,10 +4,7 @@ import os
 import re
 from typing import List
 
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_core.embeddings import Embeddings
-
-from backend.gemini_config import get_gemini_api_key
 
 
 class LocalHashEmbeddings(Embeddings):
@@ -44,6 +41,9 @@ class LocalHashEmbeddings(Embeddings):
 
 
 def _gemini_embeddings_client(model_name: str):
+    from langchain_google_genai import GoogleGenerativeAIEmbeddings
+    from backend.gemini_config import get_gemini_api_key
+
     return GoogleGenerativeAIEmbeddings(
         model=model_name,
         google_api_key=get_gemini_api_key(),

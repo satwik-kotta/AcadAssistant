@@ -2,7 +2,6 @@ import os
 import json
 import logging
 import re
-import google.generativeai as genai
 from dotenv import load_dotenv
 from backend.planner import generate_plans
 from backend.scorer import select_best_plan
@@ -10,8 +9,8 @@ from backend.calendar_tool import schedule_plan
 from backend.feedback import replan
 from backend.models import Session, StudyPlan, Task, Document as DocModel
 from backend.timetable import add_timeframes_to_plan
-from backend.gemini_config import get_gemini_model, get_gemini_api_key, DEFAULT_MODEL
 from backend.document_utils import get_all_full_texts, format_prerequisite_report
+from backend.llm_router import ChatSession, llm_call
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -154,135 +153,7 @@ When the user asks what they need to prepare or what prerequisites exist — cal
 
 Always be friendly, specific, and actionable. Never make up document content."""
 
-tools = [
-    genai.protos.Tool(function_declarations=[
-
-        genai.protos.FunctionDeclaration(
-            name="generate_study_plan",
-            description="""Generate a personalized study plan. Call this when the user asks to 
-plan, schedule, or organize their studies. Extract any constraints they mention 
-(days off, weak subjects, preferred times, topics to prioritize) and pass them.""",
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
-                properties={
-                    "request": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description="Full user request in natural language"
-                    ),
-                    "daily_hours": genai.protos.Schema(
-                        type=genai.protos.Type.NUMBER,
-                        description="Hours available per day, default 2"
-                    ),
-                    "weak_subjects": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description="Comma-separated weak subjects"
-                    ),
-                    "days_off": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description="Comma-separated days to keep free, e.g. 'Tuesday,Sunday'"
-                    ),
-                    "topic_constraints": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description="Topic/day constraints e.g. 'No Math on Thursday, ML only on weekends'"
-                    ),
-                    "start_date": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description="Start date YYYY-MM-DD"
-                    ),
-                    "start_time": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description="Start time HH:MM, default 09:00"
-                    ),
-                },
-                required=["request", "start_date"]
-            )
-        ),
-
-        genai.protos.FunctionDeclaration(
-            name="update_study_plan",
-            description="""Update the current plan based on ANY user feedback or constraint.
-Call this when the user says ANYTHING that should change their schedule:
-- Days to keep free ("keep Tuesdays free")
-- Topics to avoid on certain days ("no physics on Monday")
-- Timing changes ("start at 7pm instead")
-- Workload changes ("too much on Wednesday, reduce it")
-- Missed sessions ("I missed yesterday")
-- Gap changes ("give me longer breaks")
-- Redistribute topics ("spread ML across the whole week")
-Pass the full original user message as feedback.""",
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
-                properties={
-                    "feedback": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description="The full user message describing what they want changed"
-                    ),
-                    "start_date": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description="Date to reschedule from YYYY-MM-DD"
-                    ),
-                    "start_time": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description="Preferred start time HH:MM"
-                    ),
-                },
-                required=["feedback", "start_date"]
-            )
-        ),
-
-        genai.protos.FunctionDeclaration(
-            name="get_current_schedule",
-            description="Show the user's current study schedule or timetable.",
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
-                properties={
-                    "dummy": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description="Not used"
-                    ),
-                },
-                required=[]
-            )
-        ),
-
-        genai.protos.FunctionDeclaration(
-            name="answer_from_documents",
-            description="""Answer any question about the student's documents or study material.
-Uses a 3-mode intelligent router:
-- Today's topics (focused learning)
-- Earlier syllabus topics (prerequisite recall)  
-- External knowledge (RAG fallback)
-Use for questions about topics, deadlines, concepts, assignments, exam dates, or anything academic.""",
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
-                properties={
-                    "question": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description="The user's question"
-                    ),
-                },
-                required=["question"]
-            )
-        ),
-
-        genai.protos.FunctionDeclaration(
-            name="get_document_analysis",
-            description="""Show the prerequisite analysis for uploaded documents.
-Call when the user asks what they need to know before starting, what prerequisites
-are needed, how to prepare, or wants an overview of what was uploaded.""",
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
-                properties={
-                    "dummy": genai.protos.Schema(
-                        type=genai.protos.Type.STRING,
-                        description="Not used"
-                    ),
-                },
-                required=[]
-            )
-        ),
-    ])
-]
+tools = []
 
 
 # ── Tool executor ─────────────────────────────────────────────────────────────
@@ -480,9 +351,21 @@ def execute_tool(tool_name: str, args: dict, session_state: dict) -> tuple[str, 
             return "No documents uploaded yet. Please upload your syllabus or notes first.", None
 
         reports = []
+        from backend.enhanced_ingest import analyse_document
         for doc in docs:
+            analysis = None
             if doc.analysis_json:
                 analysis = json.loads(doc.analysis_json)
+            elif doc.full_text:
+                analysis = analyse_document(doc.full_text, doc.filename)
+                cache_session = Session()
+                cached_doc = cache_session.query(DocModel).filter_by(id=doc.id).first()
+                if cached_doc:
+                    cached_doc.analysis_json = json.dumps(analysis)
+                    cache_session.commit()
+                cache_session.close()
+
+            if analysis:
                 reports.append(format_prerequisite_report(analysis))
 
         if not reports:
@@ -500,29 +383,55 @@ def chat(user_message: str, history: list, session_state: dict) -> tuple[str, li
     Main agent chat function.
     Returns (reply_text, updated_history, updated_plan_or_None)
     """
-    genai.configure(api_key=get_gemini_api_key())
+    def _normalize_history(items: list) -> list[dict]:
+        normalized = []
+        for msg in items or []:
+            role = msg.get("role", "user")
+            content = msg.get("content")
+            if content is None and "parts" in msg:
+                parts = msg.get("parts") or []
+                text_bits = []
+                for part in parts:
+                    if isinstance(part, dict) and part.get("text"):
+                        text_bits.append(part["text"])
+                    elif isinstance(part, str):
+                        text_bits.append(part)
+                content = "\n".join(text_bits).strip()
+            if content:
+                normalized.append({"role": role, "content": content})
+        return normalized
 
-    model = genai.GenerativeModel(
-        DEFAULT_MODEL,
-        system_instruction=SYSTEM_INSTRUCTION,
-        tools=tools
-    )
-
-    # Build Gemini-compatible history
-    gemini_history = []
-    for msg in history:
-        role = msg.get("role", "user")
-        content = msg.get("content") or msg.get("parts", "")
-        if isinstance(content, str):
-            gemini_history.append({"role": role, "parts": [{"text": content}]})
-        elif isinstance(content, list):
-            text_parts = [p if isinstance(p, dict) else {"text": str(p)} for p in content]
-            if text_parts:
-                gemini_history.append({"role": role, "parts": text_parts})
+    lowered = (user_message or "").lower()
 
     try:
-        chat_session = model.start_chat(history=gemini_history)
-        response = chat_session.send_message(user_message)
+        if _looks_like_schedule_update(user_message):
+            start_date = session_state.get("start_date") or "2026-04-18"
+            start_time = session_state.get("start_time") or "09:00"
+            reply, updated_plan = execute_tool(
+                "update_study_plan",
+                {
+                    "feedback": user_message,
+                    "start_date": start_date,
+                    "start_time": start_time,
+                },
+                session_state,
+            )
+        elif _looks_like_schedule_query(user_message):
+            reply, updated_plan = execute_tool("get_current_schedule", {}, session_state)
+        elif any(keyword in lowered for keyword in [
+            "prerequisite",
+            "prerequisites",
+            "prepare",
+            "overview",
+            "topics covered",
+            "what should i know",
+        ]) or _looks_like_document_query(user_message):
+            reply, updated_plan = execute_tool("get_document_analysis", {}, session_state)
+        else:
+            chat_session = ChatSession(system_instruction=SYSTEM_INSTRUCTION)
+            chat_session.history = _normalize_history(history)
+            reply = chat_session.send_message(user_message)
+            updated_plan = None
     except Exception as e:
         logger.error(f"Agent chat error: {e}")
         try:
@@ -541,46 +450,20 @@ def chat(user_message: str, history: list, session_state: dict) -> tuple[str, li
         ]
         return fallback, updated_history, updated_plan
 
-    final_reply = ""
-    updated_plan = None
-
-    # Agentic loop — up to 5 tool calls per turn
-    for _ in range(5):
-        part = response.candidates[0].content.parts[0]
-
-        if hasattr(part, "function_call") and part.function_call.name:
-            fn = part.function_call
-            tool_name = fn.name
-            args = dict(fn.args)
-            logger.info(f"[Agent] Tool: {tool_name} | Args: {args}")
-
-            tool_result, plan_result = execute_tool(tool_name, args, session_state)
-            if plan_result is not None:
-                updated_plan = plan_result
-
-            response = chat_session.send_message(
-                genai.protos.Content(parts=[
-                    genai.protos.Part(
-                        function_response=genai.protos.FunctionResponse(
-                            name=tool_name,
-                            response={"result": tool_result}
-                        )
-                    )
-                ])
-            )
-        else:
-            final_reply = part.text
-            break
-
-    if not final_reply:
-        final_reply = "Done! Let me know if you need anything else."
-
-    updated_history = [
-        {
-            "role": m.role,
-            "parts": [p.text if hasattr(p, "text") else "" for p in m.parts]
-        }
-        for m in chat_session.history
+    updated_history = (history or []) + [
+        {"role": "user", "parts": [{"text": user_message}]},
+        {"role": "model", "parts": [{"text": reply}]},
     ]
 
-    return final_reply, updated_history, updated_plan
+    if updated_plan and session_state.get("plan_id"):
+        try:
+            db_session = Session()
+            db_plan = db_session.query(StudyPlan).filter_by(id=session_state["plan_id"]).first()
+            if db_plan:
+                db_plan.plan_json = json.dumps(updated_plan)
+                db_session.commit()
+            db_session.close()
+        except Exception as e:
+            logger.warning(f"Failed to persist updated plan from agent chat: {e}")
+
+    return reply, updated_history, updated_plan

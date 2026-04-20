@@ -26,6 +26,66 @@ function priorityClass(value) {
   return "priority-low";
 }
 
+function shuffleArray(items) {
+  const next = [...items];
+  for (let i = next.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [next[i], next[j]] = [next[j], next[i]];
+  }
+  return next;
+}
+
+function normalizeQuizQuestion(question, fallbackNumber) {
+  const baseOptions = question?.options && typeof question.options === "object" ? question.options : {};
+  const values = Object.values(baseOptions).filter((value) => value !== undefined && value !== null);
+  while (values.length < 4) {
+    values.push(`Option ${values.length + 1}`);
+  }
+
+  const letters = ["A", "B", "C", "D"];
+  const normalizedOptions = {};
+  letters.forEach((letter, idx) => {
+    normalizedOptions[letter] = String(values[idx] ?? `Option ${idx + 1}`);
+  });
+
+  const desiredCorrect = String(question?.correct_answer || "A").toUpperCase();
+  const correctAnswer = letters.includes(desiredCorrect) ? desiredCorrect : "A";
+
+  return {
+    question_number: Number(question?.question_number || fallbackNumber),
+    topic: question?.topic || "Document concepts",
+    difficulty: question?.difficulty || "medium",
+    question: question?.question || "Question unavailable",
+    options: normalizedOptions,
+    correct_answer: correctAnswer,
+    explanation: question?.explanation || "Based on the uploaded document.",
+  };
+}
+
+function shuffleQuizQuestion(question, fallbackNumber) {
+  const normalized = normalizeQuizQuestion(question, fallbackNumber);
+  const entries = shuffleArray(Object.entries(normalized.options));
+  const letters = ["A", "B", "C", "D"];
+  const shuffledOptions = {};
+
+  entries.forEach(([letter, value], idx) => {
+    shuffledOptions[letters[idx]] = value;
+  });
+
+  const correctValue = normalized.options[normalized.correct_answer];
+  const newCorrect = letters.find((letter, idx) => shuffledOptions[letter] === correctValue) || "A";
+
+  return {
+    ...normalized,
+    options: shuffledOptions,
+    correct_answer: newCorrect,
+  };
+}
+
+function prepareQuizQuestions(questions) {
+  return shuffleArray((questions || []).map((question, index) => shuffleQuizQuestion(question, index + 1)));
+}
+
 function App() {
   const [auth, setAuth] = useState({
     loading: true,
@@ -59,6 +119,9 @@ function App() {
 
   const [feedbackMsg, setFeedbackMsg] = useState("Too much workload");
   const [feedbackDate, setFeedbackDate] = useState(new Date().toISOString().slice(0, 10));
+  const [useAllDocsForPlan, setUseAllDocsForPlan] = useState(true);
+  const [selectedPlanDocIds, setSelectedPlanDocIds] = useState([]);
+  const [planSelectedDocs, setPlanSelectedDocs] = useState([]);
 
   const [notice, setNotice] = useState({ type: "info", text: "Ready." });
   const [busy, setBusy] = useState({
@@ -78,6 +141,19 @@ function App() {
   useEffect(() => {
     void bootstrapAuth();
   }, []);
+
+  useEffect(() => {
+    setSelectedPlanDocIds((prev) => prev.filter((id) => uploadedDocs.some((doc) => doc.id === id)));
+  }, [uploadedDocs]);
+
+  useEffect(() => {
+    if (useAllDocsForPlan) {
+      return;
+    }
+    if (uploadedDocs.length > 0 && selectedPlanDocIds.length === 0) {
+      setSelectedPlanDocIds(uploadedDocs.map((doc) => doc.id));
+    }
+  }, [useAllDocsForPlan, uploadedDocs, selectedPlanDocIds.length]);
 
   async function authFetch(path, options = {}) {
     if (!auth.token) {
@@ -336,11 +412,14 @@ function App() {
     try {
       const res = await authFetch(`/quiz/${docId}?num_questions=${count}`);
       const data = await parseResponse(res);
+      const sourceQuestions = (data.questions || []).map((question, index) => normalizeQuizQuestion(question, index + 1));
+      const questions = prepareQuizQuestions(sourceQuestions);
 
       setQuizData((prev) => ({
         ...prev,
         [docId]: {
-          questions: data.questions || [],
+          sourceQuestions,
+          questions,
           answers: {},
           submitted: false,
           score: 0,
@@ -361,6 +440,10 @@ function App() {
     setNotice({ type: "info", text: "Building your study plan..." });
 
     try {
+      if (!useAllDocsForPlan && selectedPlanDocIds.length === 0) {
+        throw new Error("Select at least one document for planning, or choose All Documents.");
+      }
+
       const payload = {
         request: requestText,
         daily_hours: Number(dailyHours),
@@ -370,6 +453,8 @@ function App() {
           .filter(Boolean),
         start_date: startDate,
         start_time: startTime,
+        document_ids: selectedPlanDocIds,
+        use_all_documents: useAllDocsForPlan,
       };
 
       const res = await authFetch(`/plan`, {
@@ -381,6 +466,7 @@ function App() {
       const data = await parseResponse(res);
       setPlanId(data.plan_id);
       setCurrentPlan(data.plan);
+      setPlanSelectedDocs(data.selected_documents || []);
       setAgentState((prev) => ({ ...prev, plan_id: data.plan_id, current_plan: data.plan }));
 
       setNotice({
@@ -520,10 +606,12 @@ function App() {
     setQuizData((prev) => {
       const quiz = prev[docId];
       if (!quiz) return prev;
+      const sourceQuestions = quiz.sourceQuestions || quiz.questions || [];
       return {
         ...prev,
         [docId]: {
           ...quiz,
+          questions: prepareQuizQuestions(sourceQuestions),
           answers: {},
           submitted: false,
           score: 0,
@@ -572,11 +660,28 @@ function App() {
 
           {currentPlan && (
             <div className="timetable">
-              <h3>Current Timetable</h3>
-              <p className="muted">
-                <strong>{currentPlan.plan_name || "Study Plan"}</strong>
-                {currentPlan.strategy ? ` • ${currentPlan.strategy}` : ""}
-              </p>
+              <div className="panel-header-block">
+                <div>
+                  <h3>Current Timetable</h3>
+                  <p className="muted">
+                    <strong>{currentPlan.plan_name || "Study Plan"}</strong>
+                    {currentPlan.strategy ? ` • ${currentPlan.strategy}` : ""}
+                  </p>
+                </div>
+                {currentPlan.summary && <div className="summary-badge">{currentPlan.summary}</div>}
+              </div>
+              {!!planSelectedDocs.length && (
+                <div className="plan-selected-docs">
+                  <span className="muted">Built from:</span>
+                  <div className="plan-selected-docs-list">
+                    {planSelectedDocs.map((doc) => (
+                      <span className="plan-selected-doc" key={doc.id || doc.filename}>
+                        {doc.filename}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
               <div className="days-grid">
                 {(currentPlan.days || []).map((dayBlock, idx) => (
                   <div className="day-card" key={idx}>
@@ -584,15 +689,18 @@ function App() {
                       {dayBlock.day}
                       {dayBlock.day_date ? ` • ${dayBlock.day_date}` : ""}
                     </h4>
+                    {dayBlock.study_goal && <div className="day-goal">{dayBlock.study_goal}</div>}
                     {(dayBlock.tasks || []).map((task, tIdx) => (
-                      <div className="task-row" key={tIdx}>
-                        <div className="task-time">{task.timeframe || "--:--"}</div>
-                        <div>
-                          <div className="task-topic">{task.topic}</div>
-                          <div className="task-meta">
-                            {task.duration_minutes} min <span className={priorityClass(task.priority)}>{task.priority}</span>
-                          </div>
+                      <div className="task-card" key={tIdx}>
+                        <div className="task-top-row">
+                          <div className="task-time">{task.timeframe || "--:--"}</div>
+                          <div className={`task-priority ${priorityClass(task.priority)}`}>{task.priority}</div>
                         </div>
+                        <div className="task-topic">{task.topic}</div>
+                        {task.what_to_cover && <div className="task-detail"><strong>What:</strong> {task.what_to_cover}</div>}
+                        {task.how_to_study && <div className="task-detail"><strong>How:</strong> {task.how_to_study}</div>}
+                        {task.why_now && <div className="task-detail"><strong>Why now:</strong> {task.why_now}</div>}
+                        {task.source_document && <div className="task-detail muted">Source: {task.source_document}</div>}
                       </div>
                     ))}
                   </div>
@@ -679,6 +787,61 @@ function App() {
             <button className="btn primary full" onClick={createPlan} disabled={busy.plan}>
               {busy.plan ? "Generating..." : "Generate Plan"}
             </button>
+
+            <div className="plan-doc-picker">
+              <label className="plan-toggle">
+                <input
+                  type="checkbox"
+                  checked={useAllDocsForPlan}
+                  onChange={(e) => {
+                    const checked = e.target.checked;
+                    setUseAllDocsForPlan(checked);
+                    if (checked) {
+                      setSelectedPlanDocIds([]);
+                    }
+                  }}
+                />
+                <span>Use all uploaded documents for this plan</span>
+              </label>
+
+              {!useAllDocsForPlan && (
+                <div className="plan-doc-chooser">
+                  <div className="muted plan-doc-chooser-title">
+                    Choose one or more documents:
+                  </div>
+                  {uploadedDocs.length === 0 && <div className="muted">No documents uploaded yet.</div>}
+                  {uploadedDocs.map((doc) => {
+                    const checked = selectedPlanDocIds.includes(doc.id);
+                    return (
+                      <label key={doc.id} className="plan-doc-option">
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={(e) => {
+                            const on = e.target.checked;
+                            setSelectedPlanDocIds((prev) => {
+                              if (on) return [...new Set([...prev, doc.id])];
+                              return prev.filter((id) => id !== doc.id);
+                            });
+                          }}
+                        />
+                        <span>{doc.filename}</span>
+                      </label>
+                    );
+                  })}
+                  {!!uploadedDocs.length && (
+                    <div className="button-row plan-doc-actions">
+                      <button className="btn ghost" onClick={() => setSelectedPlanDocIds(uploadedDocs.map((d) => d.id))}>
+                        Select All
+                      </button>
+                      <button className="btn ghost" onClick={() => setSelectedPlanDocIds([])}>
+                        Clear
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
           </section>
 
           <section className="panel">
@@ -714,7 +877,15 @@ function App() {
         </button>
 
         <div className="panel">
-          <h2>Prerequisites: {activeDoc?.filename || "Document"}</h2>
+          <div className="panel-header-block">
+            <div>
+              <h2>Prerequisites: {activeDoc?.filename || "Document"}</h2>
+              <p className="muted">Built from the selected document and the content extracted from it.</p>
+            </div>
+            <div className="summary-badge">
+              {prereqs.length} prerequisite{prereqs.length === 1 ? "" : "s"} • {analysis.topics_covered?.length || 0} topics
+            </div>
+          </div>
           <div className="metric-row">
             <div className="metric"><span>Subject</span><strong>{analysis.subject || "-"}</strong></div>
             <div className="metric"><span>Type</span><strong>{analysis.document_type || "-"}</strong></div>
@@ -766,7 +937,8 @@ function App() {
               <div className="topic-list">
                 {analysis.topics_covered.map((t, idx) => (
                   <div className="topic-pill" key={idx}>
-                    {t.topic} • {t.difficulty} • ~{t.estimated_hours}h
+                    <span className="topic-pill-name">{t.topic}</span>
+                    <span className="topic-pill-meta">{t.difficulty} • ~{t.estimated_hours}h</span>
                   </div>
                 ))}
               </div>
@@ -869,7 +1041,8 @@ function App() {
                       const cls = k === correct ? "correct" : chosen === k ? "wrong" : "";
                       return (
                         <li key={k} className={cls}>
-                          {k}: {val}
+                          <span className="review-letter">{k}</span>
+                          <span className="review-text">{val}</span>
                         </li>
                       );
                     })}
@@ -899,9 +1072,12 @@ function App() {
         </button>
 
         <div className="panel">
-          <h2>Quiz: {activeDoc?.filename || "Document"}</h2>
-          <div className="muted">
-            Progress: {answered}/{total} answered
+          <div className="panel-header-block">
+            <div>
+              <h2>Quiz: {activeDoc?.filename || "Document"}</h2>
+              <div className="muted">Progress: {answered}/{total} answered</div>
+            </div>
+            <div className="summary-badge">Retakes reshuffle answer order automatically.</div>
           </div>
 
           {quiz.questions.map((q) => {
@@ -922,9 +1098,8 @@ function App() {
                         checked={selected === letter}
                         onChange={() => updateAnswer(docId, q.question_number, letter)}
                       />
-                      <span>
-                        {letter}: {text}
-                      </span>
+                      <span className="option-letter">{letter}</span>
+                      <span className="option-text">{text}</span>
                     </label>
                   ))}
                 </div>
