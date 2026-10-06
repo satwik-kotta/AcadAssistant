@@ -1,0 +1,160 @@
+{
+  "arms": {
+    "A": {
+      "chunk_size": 1000,
+      "chunk_overlap": 150
+    },
+    "B": {
+      "chunk_size": 500,
+      "chunk_overlap": 75
+    }
+  },
+  "context_budget_chars": 5000,
+  "seed": 20261006,
+  "corpus": {
+    "china_cbdc": {
+      "chars": 44790
+    },
+    "long_run_risks": {
+      "chars": 58375
+    },
+    "ocr_manuscripts": {
+      "chars": 6293
+    }
+  },
+  "chunks": {
+    "A": 130,
+    "B": 258
+  },
+  "eligible_queries": 411,
+  "design": {
+    "alpha": 0.05,
+    "target_power": 0.8,
+    "mde_abs": 0.1,
+    "pilot_n": 60,
+    "pilot_control_rate": 0.7166666666666667,
+    "required_per_arm": 278,
+    "available_queries": 351,
+    "used_per_arm": 175,
+    "achieved_power_at_mde": 0.603811121016666,
+    "adequately_powered": false,
+    "smallest_effect_detectable_at_target_power": 0.125
+  },
+  "primary_hit_rate_5000_chars": {
+    "control_rate": 0.8,
+    "treatment_rate": 0.7942857142857143,
+    "diff": -0.005714285714285783,
+    "relative_lift": -0.0071428571428572285,
+    "z": -0.13292379934735143,
+    "p_value": 0.8942536447608466,
+    "ci95": [
+      -0.08997096022734735,
+      0.07854238879877579
+    ],
+    "cohens_h": -0.014210467308052532,
+    "bootstrap_ci95": [
+      -0.09142857142857141,
+      0.08000000000000007
+    ]
+  },
+  "secondary": {
+    "hit_rate_2000_chars": {
+      "control_rate": 0.68,
+      "treatment_rate": 0.7028571428571428,
+      "diff": 0.022857142857142798,
+      "relative_lift": 0.03361344537815114,
+      "z": 0.46288643383392203,
+      "p_value": 0.6434457720522677,
+      "ci95": [
+        -0.07389722655323577,
+        0.11961151226752137
+      ],
+      "cohens_h": 0.04949229601585592,
+      "p_holm": 0.6434457720522677
+    },
+    "hit_rate_1000_chars": {
+      "control_rate": 0.5314285714285715,
+      "treatment_rate": 0.6228571428571429,
+      "diff": 0.09142857142857141,
+      "relative_lift": 0.17204301075268824,
+      "z": 1.7312008729211628,
+      "p_value": 0.08341594373669818,
+      "ci95": [
+        -0.011639250902163792,
+        0.1944963937593066
+      ],
+      "cohens_h": 0.18535789218757603,
+      "p_holm": 0.16683188747339636
+    }
+  },
+  "by_document": {
+    "china_cbdc": {
+      "n_control": 42,
+      "n_treatment": 43,
+      "control_rate": 0.6666666666666666,
+      "treatment_rate": 0.8604651162790697,
+      "diff": 0.1937984496124031,
+      "relative_lift": 0.2906976744186047,
+      "z": 2.1059446767459513,
+      "p_value": 0.0352091582388692,
+      "ci95": [
+        0.01758134419140653,
+        0.37001555503339967
+      ],
+      "cohens_h": 0.46530678609769605
+    },
+    "long_run_risks": {
+      "n_control": 118,
+      "n_treatment": 117,
+      "control_rate": 0.8305084745762712,
+      "treatment_rate": 0.7777777777777778,
+      "diff": -0.052730696798493404,
+      "relative_lift": -0.06349206349206349,
+      "z": -1.0186419512879168,
+      "p_value": 0.3083729803258155,
+      "ci95": [
+        -0.15401126212059926,
+        0.048549868523612455
+      ],
+      "cohens_h": -0.1331422448780044
+    },
+    "ocr_manuscripts": {
+      "n_control": 15,
+      "n_treatment": 15,
+      "control_rate": 0.9333333333333333,
+      "treatment_rate": 0.7333333333333333,
+      "diff": -0.20000000000000007,
+      "relative_lift": -0.2142857142857143,
+      "z": -1.4696938456699076,
+      "p_value": 0.14164469029513657,
+      "ci95": [
+        -0.4569408636387125,
+        0.05694086363871237
+      ],
+      "cohens_h": -0.562963382693257
+    }
+  },
+  "document_interaction": {
+    "lr_stat": 7.841598926507402,
+    "df": 2,
+    "p_value": 0.019825238857153073
+  },
+  "balance_checks": {
+    "n_control": 175,
+    "n_treatment": 175,
+    "srm_p_value": 1.0,
+    "sentence_length_p_value": 0.9213945866620201,
+    "document_mix_p_value": 0.9920219821517191
+  },
+  "aa_test_false_positive_rate": 0.052,
+  "paired_reference_not_the_experiment": {
+    "n": 350,
+    "control_rate": 0.8028571428571428,
+    "treatment_rate": 0.7857142857142857,
+    "diff": -0.017142857142857126,
+    "only_control_hits": 54,
+    "only_treatment_hits": 48,
+    "mcnemar_p_value": 0.6205480473200617
+  },
+  "decision": "Keep 1,000-character chunks: no significant difference, and the interval rules out a change as large as the minimum effect of interest."
+}
