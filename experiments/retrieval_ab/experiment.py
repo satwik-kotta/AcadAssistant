@@ -1,4 +1,4 @@
-"""Randomized offline experiment: does a smaller chunk size retrieve better?
+"""Offline A/B test: does a smaller chunk size retrieve better?
 
     python -m experiments.retrieval_ab.experiment
 
