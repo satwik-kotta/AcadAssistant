@@ -1,14 +1,14 @@
-# Retrieval chunk-size experiment
+# Offline A/B test: retrieval chunk size
 
 Does cutting the chunk size from 1,000 to 500 characters help the assistant find the right passage?
 
 **Answer: no measurable difference. The app keeps 1,000-character chunks.**
 
-This is a randomized offline experiment on retrieval only. No users took part, so it is not an A/B test of user behaviour.
+This is an offline A/B test: queries, not users, are randomly assigned to a control and a treatment. It measures retrieval, not user behaviour.
 
 ## Result
 
-350 queries, 175 randomly assigned to each arm. Both arms retrieve the same amount of text (5,000 characters).
+350 queries, 175 randomly assigned to control (A) and 175 to treatment (B). Both arms retrieve the same amount of text (5,000 characters).
 
 | | Control: 1,000 chars, 150 overlap | Treatment: 500 chars, 75 overlap | Difference | p-value |
 |---|---|---|---|---|
